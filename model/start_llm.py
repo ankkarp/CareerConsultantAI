@@ -4,16 +4,15 @@ from typing import Dict, List, Optional
 from pathlib import Path
 import yaml
 import os
-from pathlib import Path
 from dotenv import load_dotenv
 from professions_vector_index.search_professions import rag_search
 from web_search_travily import WebSearch
-import aiohttp
 from llm_adapter import create_llm_adapter, LLMAdapter
 from prometheus_client import Counter, Gauge, Histogram
 import threading
 import time
 from datetime import datetime, timedelta
+from prometheus_client import Counter, Gauge, Histogram
 from repo.repository import Repository, RepositoryConfig
 
 # Загружаем переменные окружения из .env файла
@@ -179,12 +178,20 @@ class Model:
          
     async def add_system_message(self, content: str, user_id: str):
         self.conversation_history[user_id].append({"role": "system", "text": content})
+        self.repo.add_conversation_history(user_id, content, 'system', datetime.now(), self.user_state[user_id])
 
     async def add_human_message(self, content: str, user_id: str):
         self.conversation_history[user_id].append({"role": "user", "text": content})
+        self.repo.add_conversation_history(user_id, content, 'user', datetime.now(), self.user_state[user_id])
 
     async def add_ai_message(self, content: str, user_id: str):
         self.conversation_history[user_id].append({"role": "assistant", "text": content})
+        self.repo.add_conversation_history(user_id, content, 'assistant', datetime.now(),
+                                           self.user_state[user_id])
+
+    async def clean_conversation_history(self, user_id):
+        self.conversation_history[user_id] = []
+        self.repo.clean_conversation_history(user_id)
 
     async def extract_user_type(self, user_id: str) -> Optional[str]:
         """Извлекает тип пользователя из ответа модели"""
@@ -218,7 +225,7 @@ class Model:
 
     async def update_user_state(self, ai_response: str, user_id: str):
         current_state = self.user_state[user_id]
-        pattern = r'\[EXIT]'
+        pattern = r'\s*EXIT\s*'
         match = re.search(pattern, ai_response, re.IGNORECASE)
         if match:
             if current_state == UserState.WHO and self.user_type[user_id] is None:
@@ -226,12 +233,18 @@ class Model:
                 self.user_metadata[user_id] = {"who_user": user_story}
                 self.user_state[user_id] = UserState.ABOUT
                 self.user_type[user_id] = await self.extract_user_type(user_id)
+
+                # сохраняем промежуточный about snapshot
+                self.repo.save_metadata(user_id, self.get_user_info(user_id)[user_id])
                 return True
 
             if current_state == UserState.ABOUT:
                 user_story = await self.summarization(user_id)
                 self.user_metadata[user_id]["about_user"] = user_story
                 self.user_state[user_id] = UserState.TEST
+
+                # сохраняем промежуточный about snapshot
+                self.repo.save_metadata(user_id, self.get_user_info(user_id)[user_id])
                 return True
 
             if current_state == UserState.TEST:
@@ -240,9 +253,13 @@ class Model:
                     user_story = await self.summarization(user_id)
                     self.user_metadata[user_id]["test_user"] = user_story
                 self.user_state[user_id] = UserState.RECOMMENDATION
+
+                # сохраняем промежуточный about snapshot
+                self.repo.save_metadata(user_id, self.get_user_info(user_id)[user_id])
                 return True
 
             if current_state == UserState.TALK:
+                self.repo.save_metadata(user_id, self.get_user_info(user_id)[user_id])
                 return True
 
         return False
@@ -289,14 +306,13 @@ class Model:
             if not self.conversation_history.get(user_id):
                 system_prompt = config['who_are_you_prompt']
                 await self.add_system_message(system_prompt, user_id)
+                self.repo.save_metadata(user_id, self.get_user_info(user_id)[user_id])
             ai_response = await self.chat_loop(user_id, user_input)
             new_state = await self.update_user_state(ai_response, user_id)
-            with open('who_data.json', 'w', encoding='windows-1251') as f:
-                json.dump(self.conversation_history[user_id], f, ensure_ascii=False, indent=4)
 
             if not new_state:
                 return ai_response
-            self.conversation_history[user_id] = []
+            await self.clean_conversation_history(user_id)
             user_input = None
 
         # Этап 2: Узнаем пользователя ближе в зависимости от типа
@@ -314,11 +330,12 @@ class Model:
 
             ai_response = await self.chat_loop(user_id, user_input)
             new_state = await self.update_user_state(ai_response, user_id)
+
+
             if not new_state:
-                with open('about_data.json', 'w', encoding='windows-1251') as f:
-                    json.dump(self.conversation_history[user_id], f, ensure_ascii=False, indent=4)
                 return ai_response
-            self.conversation_history[user_id] = []
+
+            await self.clean_conversation_history(user_id)
 
         # Этап 3: Выбираем и проводим тест
         if self.user_state[user_id] == UserState.TEST:
@@ -329,22 +346,26 @@ class Model:
 
                 test_for_user = self.user_metadata[user_id]['test_for_user']
                 test_description = config['prof_tests_description'][test_for_user]
-                if len(parameters['test_results']) > 2:
-                    user_answers = await self.convert_to_qa_format(parameters['test_results'])
-                    system_prompt = (f"Перед тобой результаты тестирования пользователя. Был проведен {test_for_user}\n\n"
-                                     f"ОПИСАНИЕ ТЕСТА:\n{test_description}\n\nПроанализируй ответы пользователя."
-                                     f"Сделай суммаризацию информации, выдели ключевые аспекты")
+                if parameters.get('test_results'):
+                    if len(parameters['test_results']) > 2:
+                        user_answers = await self.convert_to_qa_format(parameters['test_results'])
+                        system_prompt = (f"Перед тобой результаты тестирования пользователя. Был проведен {test_for_user}\n\n"
+                                         f"ОПИСАНИЕ ТЕСТА:\n{test_description}\n\nПроанализируй ответы пользователя."
+                                         f"Сделай суммаризацию информации, выдели ключевые аспекты")
 
-                    user_input = (f"ПРАВИЛА ПРОХОЖДЕНИЯ ТЕСТА:\n{prof_tests['test_description'][test_for_user]}\n\n"
-                                  f"ТЕСТИРОВАНИЕ ПОЛЬЗОВАТЕЛЯ:\n{user_answers}")
+                        user_input = (f"ПРАВИЛА ПРОХОЖДЕНИЯ ТЕСТА:\n{prof_tests['test_description'][test_for_user]}\n\n"
+                                      f"ТЕСТИРОВАНИЕ ПОЛЬЗОВАТЕЛЯ:\n{user_answers}")
 
-                    await self.add_system_message(system_prompt, user_id)
-                    ai_response = await self.chat_loop(user_id, user_input)
-                    self.user_metadata[user_id]["test_user"] = ai_response
+                        await self.add_system_message(system_prompt, user_id)
+                        ai_response = await self.chat_loop(user_id, user_input)
+                        self.user_metadata[user_id]["test_user"] = ai_response
+                        self.repo.save_metadata(user_id, self.get_user_info(user_id)[user_id])
 
-                self.user_state[user_id] = UserState.RECOMMENDATION
-                self.conversation_history[user_id] = []
-                return
+                    self.user_state[user_id] = UserState.RECOMMENDATION
+                    await self.clean_conversation_history(user_id)
+
+                else:
+                    return 'empty'
 
             else:
                 if not self.conversation_history.get(user_id):
@@ -360,56 +381,72 @@ class Model:
 
                 ai_response = await self.chat_loop(user_id, user_input)
                 new_state = await self.update_user_state(ai_response, user_id)
+
                 if not new_state:
-                    with open('test_data.json', 'w', encoding='windows-1251') as f:
-                        json.dump(self.conversation_history[user_id], f, ensure_ascii=False, indent=4)
                     return ai_response
-                self.conversation_history[user_id] = []
+
+                await self.clean_conversation_history(user_id)
                 return
 
         # Этап 4: Делаем рекомендацию профессии
         if self.user_state[user_id] == UserState.RECOMMENDATION:
-            system_prompt = config['recommend_profession_prompt']
-            await self.add_system_message(system_prompt, user_id)
-            keys_with_info = ['who_user', 'about_user', 'test_user']
+            if not self.user_metadata[user_id].get('ai_recommendation_json'):
+                system_prompt = config['recommend_profession_prompt']
+                await self.add_system_message(system_prompt, user_id)
 
-            user_input = []
-            for key in keys_with_info:
-                if self.user_metadata[user_id].get(key) is not None:
-                    user_input.append(self.user_metadata[user_id][key])
-            user_input = '\n'.join(user_input)
+                keys_with_info = ['who_user', 'about_user', 'test_user']
+                parts = []
+                for key in keys_with_info:
+                    if self.user_metadata[user_id].get(key) is not None:
+                        parts.append(self.user_metadata[user_id][key])
+                user_input_merged = '\n'.join(parts)
+                user_input_merged = f"\n\nИнформация о пользователе:\n{user_input_merged}"
 
-            user_input = f"\n\nИнформация о пользователе:\n{user_input}"
-            ai_response = await self.chat_loop(user_id, user_input)
-            self.user_metadata[user_id]['ai_recommendation'] = ai_response
-            self.user_metadata[user_id]['ai_recommendation_json'] = await self.toll_run(ai_response,
-                                                                                        tool_name='make_json_tool')
+                ai_response = await self.chat_loop(user_id, user_input_merged)
+
+                self.user_metadata[user_id]['ai_recommendation'] = ai_response
+                self.user_metadata[user_id]['ai_recommendation_json'] = await self.toll_run(
+                    ai_response, tool_name='make_json_tool'
+                )
+                self.repo.save_metadata(user_id, self.get_user_info(user_id)[user_id])
+
+            else:
+                ai_response = ''
+
             self.user_state[user_id] = UserState.TALK
-            self.conversation_history[user_id] = []
-            return ai_response
+            await self.clean_conversation_history(user_id)
+
+            if ai_response != '':
+                return ai_response
 
         if self.user_state[user_id] == UserState.TALK:
             # if not self.conversation_history.get(user_id):
             system_prompt = config['talk_prompt']
             system_prompt = system_prompt.replace("<who_user>", self.user_metadata[user_id]["who_user"])
             system_prompt = system_prompt.replace("<about_user>", self.user_metadata[user_id]["about_user"])
-            system_prompt = system_prompt.replace("<test_user>", self.user_metadata[user_id]["test_user"])
+            system_prompt = system_prompt.replace("<test_user>", self.user_metadata[user_id].get("test_user", ''))
             if self.user_metadata[user_id]["ai_recommendation_json"]:
                 system_prompt = system_prompt.replace("<ai_recommendation_json>",
                                                       str(self.user_metadata[user_id]["ai_recommendation_json"][
                                                               "professions"]))
             else:
                 system_prompt = system_prompt.replace("# РЕКОМЕНДОВАННЫЕ ПРОФЕССИИ:", "")
+
             if len(self.conversation_history[user_id]) == 0:
                 await self.add_system_message(system_prompt, user_id)
+
             self.conversation_history[user_id].insert(0, {"role": "system", "text": system_prompt})
             ai_response = await self.chat_loop(user_id, user_input)
+
             new_recommendation = await self.toll_run(ai_response, tool_name='is_recommendation_tool')
-            if new_recommendation:
-                if new_recommendation['new_recommendation']:
-                    self.user_metadata[user_id]['ai_recommendation'] = ai_response
-                    self.user_metadata[user_id]['ai_recommendation_json'] = await self.toll_run(ai_response,
-                                                                                                tool_name='make_json_tool')
+            if new_recommendation and new_recommendation.get('new_recommendation'):
+                self.user_metadata[user_id]['ai_recommendation'] = ai_response
+                self.user_metadata[user_id]['ai_recommendation_json'] = await self.toll_run(
+                    ai_response, tool_name='make_json_tool'
+                )
+
+            self.repo.save_metadata(user_id, self.get_user_info(user_id)[user_id])
+
             return ai_response
 
     async def go_rag(self, profession_name, user_id=0):
@@ -526,7 +563,8 @@ class Model:
         ai_response = await self.chat_loop(user_id, user_input)
 
         self.user_metadata[user_id]['recommended_test'] = ai_response
-        self.conversation_history[user_id] = []
+        self.repo.save_metadata(user_id, self.get_user_info(user_id)[user_id])
+        await self.clean_conversation_history(user_id)
 
     async def recommend_test_v2(self, user_id: str):
         """Рекомендует тест на основе информации о пользователе - вибираем из предоставленных"""
@@ -537,6 +575,7 @@ class Model:
         test_for_user = await self.toll_run(message=select_test_message, tool_name='select_test_tool')
         test_for_user = test_for_user['user_test']
         self.user_metadata[user_id]['test_for_user'] = test_for_user
+        self.repo.save_metadata(user_id, self.get_user_info(user_id)[user_id])
 
         test_description = prof_tests['test_description'][test_for_user]
         test_questions = prof_tests['test_questions'][test_for_user]
@@ -544,6 +583,7 @@ class Model:
         self.user_metadata[user_id]['recommended_test'] = {'test_description': test_description,
                                                            'test_questions': test_questions,
                                                            'test_bottoms': test_bottoms, }
+        self.repo.save_metadata(user_id, self.get_user_info(user_id)[user_id])
 
         return 'empty'
 
